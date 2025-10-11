@@ -1,13 +1,83 @@
 # -*- coding: utf-8 -*-
 import sys
+import os
+import re
+import subprocess
 import pyodbc
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QPushButton, QVBoxLayout, QTableWidget, QTableWidgetItem,
-    QMessageBox, QCheckBox, QLabel, QInputDialog
+    QApplication,
+    QWidget,
+    QPushButton,
+    QVBoxLayout,
+    QTableWidget,
+    QTableWidgetItem,
+    QMessageBox,
+    QCheckBox,
+    QLabel,
+    QInputDialog,
+    QFileDialog,
+    QLineEdit,
+    QFormLayout,
+    QDesktopWidget,
 )
-from PyQt5.QtCore import Qt
-from PyQt5.QtCore import QTimer
-from PyQt5.QtWidgets import QWidget, QVBoxLayout, QLabel, QMessageBox
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QIcon
+from PyQt5.QtCore import QSettings
+
+# ----------------------------- ثابت‌های عمومی -----------------------------
+DEFAULT_PASSWORD = "xx17737xx"
+SETTINGS_ORG = "AccessApp"
+SETTINGS_APP = "UserAccessManager"
+
+# ------------------------------ ابزارهای کمکی UI ------------------------------
+def center_window(widget: QWidget) -> None:
+    """قرار دادن پنجره در مرکز صفحه."""
+    try:
+        qr = widget.frameGeometry()
+        cp = QDesktopWidget().availableGeometry().center()
+        qr.moveCenter(cp)
+        widget.move(qr.topLeft())
+    except Exception:
+        # روی برخی پلتفرم‌ها ممکن است در ابتدای ساخت مشکلی ایجاد شود؛ نادیده بگیر.
+        pass
+
+
+def get_saved_icon_path() -> str:
+    settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+    return settings.value("windowIconPath", type=str)
+
+
+def set_saved_icon_path(path: str) -> None:
+    settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+    settings.setValue("windowIconPath", path)
+
+
+def apply_window_icon(widget: QWidget) -> None:
+    icon_path = get_saved_icon_path()
+    if icon_path and os.path.exists(icon_path):
+        widget.setWindowIcon(QIcon(icon_path))
+
+
+def apply_app_icon(app: QApplication) -> None:
+    icon_path = get_saved_icon_path()
+    if icon_path and os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
+
+
+def apply_theme(app: QApplication) -> None:
+    """اعمال یک تم مدرن و مینیمال با رنگ‌های به‌روز."""
+    qss = """
+        QWidget { background: #0f172a; color: #e2e8f0; font-size: 13px; }
+        QPushButton { background: #3b82f6; color: white; border: none; padding: 8px 12px; border-radius: 6px; }
+        QPushButton:hover { background: #2563eb; }
+        QPushButton:disabled { background: #334155; color: #94a3b8; }
+        QLineEdit, QInputDialog, QTableWidget, QTableView { background: #111827; color: #e5e7eb; border: 1px solid #334155; border-radius: 6px; padding: 6px; }
+        QHeaderView::section { background: #1f2937; color: #cbd5e1; padding: 6px; border: none; }
+        QCheckBox { spacing: 8px; }
+        QMessageBox { background: #0f172a; }
+        QLabel { color: #e2e8f0; }
+    """
+    app.setStyleSheet(qss)
 # ----------------------------- تنظیمات پیش‌فرض اتصال -----------------------------
 # (طبق درخواستی که گفتی این مقادیر به‌صورت پیش‌فرض استفاده شوند)
 SERVER = r".\Moein2012"
@@ -15,53 +85,234 @@ DATABASE = "Moein1"
 USERNAME = "Sa"
 PASSWORD = "arta0@"
 
+# ------------------------------ توابع اتصال خودکار (ادغام‌شده از OpenDB) ------------------------------
+def find_sql_instances():
+    """یافتن Instance های SQL Server (روی ویندوز). روی لینوکس معمولاً خالی می‌ماند."""
+    try:
+        cmd = (
+            'powershell "Get-ChildItem '
+            "'HKLM:\\SOFTWARE\\Microsoft\\Microsoft SQL Server\\Instance Names\\SQL' "
+            '| ForEach-Object { $_.Name.Split(\'\\\\\')[-1] }"'
+        )
+        output = subprocess.check_output(cmd, shell=True, text=True)
+        instances = [inst.strip() for inst in output.splitlines() if inst.strip()]
+        return instances
+    except Exception:
+        return []
+
+
+def find_latest_moein_db(server_name, username="sa", password="arta0@"):
+    try:
+        conn_str = f"DRIVER={{SQL Server}};SERVER={server_name};UID={username};PWD={password}"
+        conn = pyodbc.connect(conn_str, timeout=3)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT name FROM sys.databases WHERE name LIKE 'Moein%' ORDER BY name ASC;"
+        )
+        dbs = [r[0] for r in cursor.fetchall()]
+        if not dbs:
+            return None
+        dbs_sorted = sorted(
+            dbs,
+            key=lambda x: int(re.findall(r"\d+", x)[0]) if re.findall(r"\d+", x) else 0,
+        )
+        return dbs_sorted[-1]
+    except Exception:
+        return None
+
+
+def auto_connect():
+    possible_instances = [
+        r".\Moein",
+        r".\Moein2008",
+        r".\Moein2012",
+        r".\Moein2014",
+        r".\Moein2019",
+        r".\Moein2022",
+    ]
+    possible_instances.extend(find_sql_instances())
+
+    for instance in possible_instances:
+        db = find_latest_moein_db(instance)
+        if db:
+            try:
+                conn_str = (
+                    f"DRIVER={{SQL Server}};SERVER={instance};DATABASE={db};UID=sa;PWD=arta0@"
+                )
+                conn = pyodbc.connect(conn_str, autocommit=False)
+                return conn, instance, db
+            except Exception:
+                continue
+    return None, None, None
+
 # ----------------------------- پنجره‌ی اتصال -----------------------------
-class ConnectWindow(QWidget):
+class LoginWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("اتصال به دیتابیس Moein")
-        self.setGeometry(400, 250, 350, 120)
+        self.setWindowTitle("ورود به برنامه")
+        self.setGeometry(500, 300, 380, 160)
+        apply_window_icon(self)
+        center_window(self)
 
-        # نمایش پیام اولیه
         layout = QVBoxLayout()
-        self.label = QLabel("در حال تلاش برای اتصال به دیتابیس ...")
-        layout.addWidget(self.label)
+        form = QFormLayout()
+        self.txt_password = QLineEdit()
+        self.txt_password.setEchoMode(QLineEdit.Password)
+        self.txt_password.setPlaceholderText("رمز عبور را وارد کنید")
+        form.addRow("رمز عبور:", self.txt_password)
+        layout.addLayout(form)
+
+        self.btn_login = QPushButton("ورود")
+        self.btn_login.clicked.connect(self.handle_login)
+        layout.addWidget(self.btn_login, alignment=Qt.AlignCenter)
+
+        self.btn_icon = QPushButton("تغییر آیکون")
+        self.btn_icon.clicked.connect(self.change_icon)
+        layout.addWidget(self.btn_icon, alignment=Qt.AlignCenter)
+
         self.setLayout(layout)
 
-        # ⚠️ نکته مهم:
-        # به جای اینکه مستقیماً connect_to_db را صدا بزنیم، با تاخیر 100 میلی‌ثانیه صدا می‌زنیم
-        QTimer.singleShot(100, self.connect_to_db)
+    def handle_login(self):
+        entered = self.txt_password.text().strip()
+        if entered == DEFAULT_PASSWORD:
+            self.close()
+            self.auto = AutoConnectWindow()
+            self.auto.show()
+        else:
+            QMessageBox.warning(self, "رمز نادرست", "رمز عبور صحیح نیست.")
+
+    def change_icon(self):
+        path, _ = QFileDialog.getOpenFileName(self, "انتخاب آیکون", "", "Images (*.png *.ico *.jpg)")
+        if path:
+            set_saved_icon_path(path)
+            apply_window_icon(self)
+            app = QApplication.instance()
+            if app:
+                apply_app_icon(app)
+
+
+class ManualConnectWindow(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("تنظیمات اتصال به SQL Server (اتصال دستی)")
+        self.setGeometry(500, 250, 400, 260)
+        apply_window_icon(self)
+        center_window(self)
+
+        layout = QVBoxLayout()
+
+        form = QFormLayout()
+        self.txt_server = QLineEdit(r".\Moein")
+        self.txt_db = QLineEdit("Moein")
+        self.txt_user = QLineEdit("sa")
+        self.txt_pass = QLineEdit("arta0@")
+        self.txt_pass.setEchoMode(QLineEdit.Password)
+
+        form.addRow("Server Name:", self.txt_server)
+        form.addRow("Database Name:", self.txt_db)
+        form.addRow("Username:", self.txt_user)
+        form.addRow("Password:", self.txt_pass)
+
+        layout.addLayout(form)
+
+        btns = QVBoxLayout()
+        self.btn_connect = QPushButton("اتصال به دیتابیس")
+        self.btn_connect.clicked.connect(self.connect_to_db)
+        layout.addWidget(self.btn_connect, alignment=Qt.AlignCenter)
+
+        self.btn_icon = QPushButton("تغییر آیکون")
+        self.btn_icon.clicked.connect(self.change_icon)
+        layout.addWidget(self.btn_icon, alignment=Qt.AlignCenter)
+
+        self.setLayout(layout)
+
+    def change_icon(self):
+        path, _ = QFileDialog.getOpenFileName(self, "انتخاب آیکون", "", "Images (*.png *.ico *.jpg)")
+        if path:
+            set_saved_icon_path(path)
+            apply_window_icon(self)
+            app = QApplication.instance()
+            if app:
+                apply_app_icon(app)
 
     def connect_to_db(self):
-        try:
-            conn_str = (
-                f"DRIVER={{SQL Server}};"
-                f"SERVER={SERVER};DATABASE={DATABASE};UID={USERNAME};PWD={PASSWORD}"
-            )
-            self.conn = pyodbc.connect(conn_str, autocommit=False)
-            cursor = self.conn.cursor()
+        server = self.txt_server.text().strip()
+        db = self.txt_db.text().strip()
+        user = self.txt_user.text().strip()
+        pwd = self.txt_pass.text().strip()
 
-            # بررسی ستون IsActive
-            cursor.execute("""
+        try:
+            conn_str = f"DRIVER={{SQL Server}};SERVER={server};DATABASE={db};UID={user};PWD={pwd}"
+            conn = pyodbc.connect(conn_str, autocommit=False)
+
+            cursor = conn.cursor()
+            cursor.execute(
+                """
                 SELECT COLUMN_NAME
                 FROM INFORMATION_SCHEMA.COLUMNS
                 WHERE TABLE_NAME = 'UserAccess' AND COLUMN_NAME = 'IsActive'
-            """)
+                """
+            )
             exists = cursor.fetchone()
             if not exists:
                 cursor.execute("ALTER TABLE dbo.UserAccess ADD IsActive BIT DEFAULT 1;")
-                self.conn.commit()
+                conn.commit()
 
-            QMessageBox.information(self, "نتیجه اتصال", "اتصال به دیتابیس موفق بود ✅")
-
-            # ✅ بستن پنجره و رفتن به مرحله بعد
+            QMessageBox.information(self, "موفقیت ✅", f"اتصال موفق به دیتابیس '{db}' برقرار شد.")
             self.close()
-            self.main_window = MainWindow(self.conn)
+            self.main_window = MainWindow(conn)
             self.main_window.show()
 
         except Exception as e:
-            QMessageBox.critical(self, "خطا در اتصال", f"اتصال به دیتابیس ناموفق بود ❌\n{str(e)}")
+            QMessageBox.critical(self, "خطا ❌", f"اتصال ناموفق بود:\n{str(e)}")
+
+
+class AutoConnectWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("اتصال خودکار به SQL Server")
+        self.setGeometry(500, 300, 380, 120)
+        apply_window_icon(self)
+        center_window(self)
+
+        layout = QVBoxLayout()
+        self.label = QLabel("در حال تلاش برای اتصال خودکار به دیتابیس Moein ...")
+        self.label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.label)
+        
+        self.btn_icon = QPushButton("تغییر آیکون")
+        self.btn_icon.clicked.connect(self.change_icon)
+        layout.addWidget(self.btn_icon, alignment=Qt.AlignCenter)
+
+        self.setLayout(layout)
+
+        QTimer.singleShot(100, self.try_auto_connect)
+
+    def change_icon(self):
+        path, _ = QFileDialog.getOpenFileName(self, "انتخاب آیکون", "", "Images (*.png *.ico *.jpg)")
+        if path:
+            set_saved_icon_path(path)
+            apply_window_icon(self)
+            app = QApplication.instance()
+            if app:
+                apply_app_icon(app)
+
+    def try_auto_connect(self):
+        conn, server, db = auto_connect()
+        if conn:
+            QMessageBox.information(self, "موفقیت ✅", f"اتصال خودکار برقرار شد:\n{server} → {db}")
             self.close()
+            self.main_window = MainWindow(conn)
+            self.main_window.show()
+        else:
+            QMessageBox.warning(
+                self,
+                "اتصال خودکار ناموفق ⚠️",
+                "هیچ دیتابیس Moein پیدا نشد. لطفاً اتصال دستی را انجام دهید.",
+            )
+            self.close()
+            self.manual = ManualConnectWindow()
+            self.manual.show()
 
 # ----------------------------- پنجره‌ی اصلی -----------------------------
 class MainWindow(QWidget):
@@ -71,20 +322,27 @@ class MainWindow(QWidget):
         self.conn = connection
 
         self.setWindowTitle("مدیریت سطح دسترسی کاربران")
-        self.setGeometry(250, 80, 900, 600)
+        self.setGeometry(250, 80, 980, 620)
+        apply_window_icon(self)
+        center_window(self)
 
         # چیدمان کلی عمودی
         layout = QVBoxLayout()
 
         # دکمه‌ها برای نمایش حالت‌های مختلف
-        self.btn_show_allowed = QPushButton("✅ الف: نمایش فرم‌هایی که کاربر دسترسی ندارد")
-        self.btn_show_denied = QPushButton("✅ ب: نمایش فرم‌هایی که کاربر دسترسی دارد")
+        self.btn_show_allowed = QPushButton("الف: نمایش فرم‌هایی که کاربر دسترسی دارد")
+        self.btn_show_denied = QPushButton("ب: نمایش فرم‌هایی که کاربر دسترسی ندارد (با امکان فعال‌سازی)")
         self.btn_show_all = QPushButton("نمایش همه فرم‌ها (ویرایش وضعیت دسترسی)")
+
+        # دکمه تنظیم آیکون
+        self.btn_change_icon = QPushButton("تغییر آیکون پنجره‌ها")
+        self.btn_change_icon.clicked.connect(self.change_icon)
 
         # افزودن دکمه‌ها به چیدمان
         layout.addWidget(self.btn_show_allowed)
         layout.addWidget(self.btn_show_denied)
         layout.addWidget(self.btn_show_all)
+        layout.addWidget(self.btn_change_icon)
 
         # جدول برای نمایش اطلاعات
         self.table = QTableWidget()
@@ -100,8 +358,7 @@ class MainWindow(QWidget):
     # ------------------ نمایش فرم‌هایی که کاربر دسترسی دارد ------------------
     def show_allowed_forms(self):
         """
-        توجه: این کوئری اکنون ستون AccessStatus و FormButtonId را برمی‌گرداند
-        تا load_data بتواند checkbox و عملیات بروز‌رسانی را انجام دهد.
+        نمایش دسترسی‌های موجود کاربر در سطح Button؛ امکان تغییر با تیک فعال.
         """
         user_id, ok = self.ask_user_id()
         if not ok:
@@ -129,20 +386,18 @@ class MainWindow(QWidget):
         if not ok:
             return
 
+        # فرم‌هایی که کاربر هیچ دسترسی فعالی به دکمه‌های آن ندارد
         query = f"""
-            SELECT 
-                f.ID AS FormId,
-                f.Name AS FormName
+            SELECT f.ID AS FormId, f.Name AS FormName
             FROM dbo.Forms f
-            WHERE f.ID NOT IN (
-                SELECT fb.IDForm 
-                FROM dbo.FormButtons fb
-                JOIN dbo.UserAccess ua ON fb.ID = ua.FormButtonsId
-                WHERE ua.UserId = {user_id}
-            );
+            LEFT JOIN dbo.FormButtons fb ON fb.IDForm = f.ID
+            LEFT JOIN dbo.UserAccess ua 
+                ON ua.FormButtonsId = fb.ID AND ua.UserId = {user_id}
+            GROUP BY f.ID, f.Name
+            HAVING SUM(CASE WHEN ISNULL(ua.IsActive, 0) = 1 THEN 1 ELSE 0 END) = 0
+            ORDER BY f.Name;
         """
-        # editable=False چون این حالت فقط نمایش است
-        self.load_data(query, editable=False, user_id=user_id)
+        self.load_denied_forms(query, user_id=user_id)
 
     # ------------------ نمایش همه فرم‌ها با وضعیت و قابلیت ویرایش ------------------
     def show_all_forms(self):
@@ -284,6 +539,80 @@ class MainWindow(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "خطا در ذخیره تغییر", f"خطا هنگام ذخیره تغییر:\n{str(e)}")
 
+    # ------------------ نمایش فرم‌های بدون دسترسی با تیک فعال‌سازی ------------------
+    def load_denied_forms(self, query, user_id):
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(query)
+            columns = [desc[0] for desc in cursor.description]
+            rows = cursor.fetchall()
+
+            # اضافه یک ستون برای چک‌باکس فعال‌سازی
+            self.table.setColumnCount(len(columns) + 1)
+            self.table.setRowCount(len(rows))
+
+            headers = columns + ["فعال؟"]
+            self.table.setHorizontalHeaderLabels(headers)
+
+            form_id_idx = columns.index("FormId") if "FormId" in columns else None
+            for i, row in enumerate(rows):
+                for j, val in enumerate(row):
+                    text = "" if val is None else str(val)
+                    item = QTableWidgetItem(text)
+                    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                    self.table.setItem(i, j, item)
+
+                form_id = row[form_id_idx] if form_id_idx is not None else None
+                chk = QCheckBox()
+                chk.setChecked(False)
+                if form_id is not None:
+                    chk.stateChanged.connect(
+                        lambda state, fid=form_id, uid=user_id: self.set_form_access(uid, fid, state)
+                    )
+                else:
+                    chk.setEnabled(False)
+                self.table.setCellWidget(i, len(columns), chk)
+        except Exception as e:
+            QMessageBox.critical(self, "خطا در اجرا", f"خطا هنگام بارگذاری داده:\n{str(e)}")
+
+    def set_form_access(self, user_id, form_id, state):
+        try:
+            cursor = self.conn.cursor()
+            active = 1 if state == Qt.Checked else 0
+            sql = """
+                -- ابتدا بروزرسانی ردیف‌های موجود برای این فرم
+                UPDATE ua SET ua.IsActive = ?
+                FROM dbo.UserAccess ua
+                JOIN dbo.FormButtons fb ON ua.FormButtonsId = fb.ID
+                WHERE ua.UserId = ? AND fb.IDForm = ?;
+
+                -- سپس درج ردیف‌های جدید برای دکمه‌های فاقد رکورد
+                INSERT INTO dbo.UserAccess (UserId, FormButtonsId, IsActive)
+                SELECT ?, fb.ID, ?
+                FROM dbo.FormButtons fb
+                WHERE fb.IDForm = ? AND NOT EXISTS (
+                    SELECT 1 FROM dbo.UserAccess ua
+                    WHERE ua.UserId = ? AND ua.FormButtonsId = fb.ID
+                );
+            """
+            params = (
+                active, user_id, form_id,
+                user_id, active, form_id, user_id,
+            )
+            cursor.execute(sql, params)
+            self.conn.commit()
+        except Exception as e:
+            QMessageBox.critical(self, "خطا در ذخیره تغییر", f"خطا هنگام ذخیره تغییر:\n{str(e)}")
+
+    def change_icon(self):
+        path, _ = QFileDialog.getOpenFileName(self, "انتخاب آیکون", "", "Images (*.png *.ico *.jpg)")
+        if path:
+            set_saved_icon_path(path)
+            apply_window_icon(self)
+            app = QApplication.instance()
+            if app:
+                apply_app_icon(app)
+
     # ------------------ گرفتن UserId از کاربر ------------------
     def ask_user_id(self):
         """
@@ -294,8 +623,14 @@ class MainWindow(QWidget):
         return user_id, ok
 
 # ----------------------------- اجرای برنامه -----------------------------
-if __name__ == "__main__":
+def start_application():
     app = QApplication(sys.argv)
-    connect_window = ConnectWindow()
-    connect_window.show()
-    sys.exit(app.exec_())
+    apply_app_icon(app)
+    apply_theme(app)
+    login = LoginWindow()
+    login.show()
+    return app.exec_()
+
+
+if __name__ == "__main__":
+    sys.exit(start_application())
