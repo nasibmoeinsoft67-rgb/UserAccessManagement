@@ -81,6 +81,68 @@ def apply_theme(app: QApplication) -> None:
         QLabel { color: #e2e8f0; }
     """
     app.setStyleSheet(qss)
+
+# ------------------------------ نرمال‌سازی متن فارسی ------------------------------
+def normalize_persian_text(text: str) -> str:
+    """یک نرمال‌ساز ساده برای یکنواخت‌سازی حروف پر تکرار عربی/فارسی.
+
+    این کار خطاهای جست‌وجو را به‌خاطر تفاوت کدپوینت «ی/ي» و «ک/ك» و همچنین
+    وجود نیم‌فاصله و کشیده کاهش می‌دهد.
+    """
+    if not isinstance(text, str):
+        return text
+    replacements = {
+        "\u064A": "\u06CC",  # ي -> ی
+        "\u0643": "\u06A9",  # ك -> ک
+        "\u0629": "\u0647",  # ة -> ه
+        "\u064B": "",         # ً  تنوین
+        "\u064C": "",         # ٌ
+        "\u064D": "",         # ٍ
+        "\u064E": "",         # َ
+        "\u064F": "",         # ُ
+        "\u0650": "",         # ِ
+        "\u0651": "",         # ّ
+        "\u0652": "",         # ْ
+        "\u0670": "",         # ٰ
+        "\u0622": "\u0627",  # آ -> ا (برای جست‌وجوی سهل‌گیر)
+        "\u0623": "\u0627",  # أ -> ا
+        "\u0625": "\u0627",  # إ -> ا
+        "\u0624": "\u0648",  # ؤ -> و
+        "\u06C0": "\u0647",  # ۀ -> ه
+        "\u0640": "",         # ـ کشیده
+        "\u200C": "",         # ZWNJ
+        "\u200F": "",         # RLM
+        "\u200E": "",         # LRM
+    }
+    normalized = text
+    for src, dst in replacements.items():
+        normalized = normalized.replace(src, dst)
+    # فاصله‌های تکراری را یکدست کن
+    normalized = " ".join(normalized.split())
+    return normalized
+
+def build_like_param(text: str) -> str:
+    return f"%{normalize_persian_text(text)}%"
+
+def candidate_collations() -> list:
+    # ترتیب از اختصاصی‌ترین به عمومی‌ترین
+    return [
+        "Persian_100_CI_AI",
+        "Arabic_100_CI_AI",
+        "SQL_Latin1_General_CP1256_CI_AI",
+    ]
+
+def sql_normalize_expr(col_expr: str) -> str:
+    """نسخه‌ی SQL از نرمال‌ساز: جایگزینی چند کاراکتر رایج در خود دیتابیس.
+
+    از N'..' برای لیتِرال‌های یونیکد استفاده می‌کنیم تا در همه کُدپیج‌ها درست باشند.
+    """
+    # توجه: از NCHAR برای حذف کاراکترهای کنترل راست‌به‌چپ و نیم‌فاصله استفاده می‌شود
+    return (
+        "REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE("
+        f"{col_expr}, N'ي', N'ی'), N'ى', N'ی'), N'ك', N'ک'), N'ۀ', N'ه'), N'ة', N'ه'), N'ـ', N''), "
+        "NCHAR(8204), N''), NCHAR(8205), N'')"
+    )
 # ----------------------------- تنظیمات پیش‌فرض اتصال -----------------------------
 # (طبق درخواستی که گفتی این مقادیر به‌صورت پیش‌فرض استفاده شوند)
 SERVER = r".\Moein2012"
@@ -394,7 +456,9 @@ class MainWindow(QWidget):
 
     # ------------------ فیلتر کردن جدول بر اساس جست‌وجو ------------------
     def filter_table(self, text: str):
-        tokens = [t.strip() for t in text.split() if t.strip()]
+        # نرمال‌سازی حروف برای جست‌وجوی درست «مشتری/مديريت/مدیریت/مـدیریت» و ...
+        norm_text = normalize_persian_text(text or "")
+        tokens = [t.strip() for t in norm_text.split() if t.strip()]
         row_count = self.table.rowCount()
         col_count = self.table.columnCount()
         for i in range(row_count):
@@ -404,7 +468,8 @@ class MainWindow(QWidget):
                 item = self.table.item(i, j)
                 if item is not None:
                     cell_texts.append(item.text())
-            row_text = " ".join(cell_texts)
+            # نرمال‌سازی متن ردیف نیز
+            row_text = normalize_persian_text(" ".join(cell_texts))
             visible = True
             for tok in tokens:
                 if tok.lower() not in row_text.lower():
@@ -645,26 +710,36 @@ class MainWindow(QWidget):
 
     def query_users_by_name(self, name_part: str):
         cursor = self.conn.cursor()
+        norm = normalize_persian_text(name_part)
 
         # مرحله‌ی اول: تلاش مستقیم روی جدول Authorize (در صورت وجود)
-        # این کار مشکل شناسایی جدول/ستون و تکرار رکوردها را کاهش می‌دهد.
+        # با COLLATE سهل‌گیر و نرمال‌سازی ستون برای پوشش تفاوت «ی/ك/كشیده»
         try:
+            # ابتدا تلاش بدون COLLATE
             sql = (
-                """
-                SELECT TOP 50
-                    A.id      AS Id,
-                    A.UserName AS Name
-                FROM dbo.Authorize A
-                WHERE A.UserName LIKE ?
-                ORDER BY A.UserName;
-                """
+                "SELECT TOP 50 A.id AS Id, A.UserName AS Name "
+                "FROM dbo.Authorize A WHERE "
+                f"{sql_normalize_expr('A.UserName')} LIKE ? ORDER BY A.UserName;"
             )
-            cursor.execute(sql, (f"%{name_part}%",))
+            cursor.execute(sql, (build_like_param(norm),))
             rows = cursor.fetchall()
             if rows:
                 return [(r[0], "" if r[1] is None else str(r[1])) for r in rows]
+
+            # اگر خروجی نداشت، با COLLATE های مختلف امتحان می‌کنیم
+            for coll in candidate_collations():
+                sql = (
+                    "SELECT TOP 50 A.id AS Id, A.UserName AS Name "
+                    "FROM dbo.Authorize A WHERE "
+                    f"{sql_normalize_expr('A.UserName')} COLLATE {coll} LIKE ? "
+                    "ORDER BY A.UserName;"
+                )
+                cursor.execute(sql, (build_like_param(norm),))
+                rows = cursor.fetchall()
+                if rows:
+                    return [(r[0], "" if r[1] is None else str(r[1])) for r in rows]
         except Exception:
-            # اگر جدول/ستون Authorize وجود نداشت، به روش انعطاف‌پذیر قبلی برگرد.
+            # اگر جدول/ستون Authorize موجود نبود یا اجرای کوئری مشکل داشت
             pass
 
         # مرحله‌ی دوم: روش انعطاف‌پذیر روی چند جدول/ستون احتمالی
@@ -675,16 +750,26 @@ class MainWindow(QWidget):
             for idc in id_candidates:
                 for nc in name_candidates:
                     try:
+                        # تلاش اولیه بدون COLLATE
                         sql = (
-                            f"SELECT TOP 50 {idc} AS Id, {nc} AS Name "
-                            f"FROM dbo.{t} WHERE {nc} LIKE ? ORDER BY {nc};"
+                            f"SELECT TOP 50 {idc} AS Id, {nc} AS Name FROM dbo.{t} "
+                            f"WHERE {sql_normalize_expr(nc)} LIKE ? ORDER BY {nc};"
                         )
-                        cursor.execute(sql, (f"%{name_part}%",))
+                        cursor.execute(sql, (build_like_param(norm),))
                         rows = cursor.fetchall()
                         if rows:
-                            return [
-                                (r[0], "" if r[1] is None else str(r[1])) for r in rows
-                            ]
+                            return [(r[0], "" if r[1] is None else str(r[1])) for r in rows]
+
+                        # سپس با COLLATEهای مختلف
+                        for coll in candidate_collations():
+                            sql = (
+                                f"SELECT TOP 50 {idc} AS Id, {nc} AS Name FROM dbo.{t} "
+                                f"WHERE {sql_normalize_expr(nc)} COLLATE {coll} LIKE ? ORDER BY {nc};"
+                            )
+                            cursor.execute(sql, (build_like_param(norm),))
+                            rows = cursor.fetchall()
+                            if rows:
+                                return [(r[0], "" if r[1] is None else str(r[1])) for r in rows]
                     except Exception:
                         continue
         return []
