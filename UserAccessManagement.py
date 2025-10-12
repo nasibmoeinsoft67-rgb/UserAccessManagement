@@ -620,6 +620,7 @@ class MainWindow(QWidget):
             text, ok = QInputDialog.getText(self, "انتخاب کاربر", "نام کاربر را وارد کنید (یا بخشی از آن):")
             if not ok or not text.strip():
                 return False
+            # ابتدا از Authorize با EXISTS روی UserAccess استفاده می‌کنیم تا تکرار نداشته باشیم
             candidates = self.query_users_by_name(text.strip())
             if not candidates:
                 QMessageBox.warning(self, "یافت نشد", "کاربری با این نام پیدا نشد.")
@@ -644,18 +645,46 @@ class MainWindow(QWidget):
 
     def query_users_by_name(self, name_part: str):
         cursor = self.conn.cursor()
-        table_candidates = ["Users", "User", "tblUsers", "tblUser"]
-        id_candidates = ["ID", "Id", "UserId"]
-        name_candidates = ["Name", "FullName", "UserName", "Username"]
+
+        # مرحله‌ی اول: تلاش مستقیم روی جدول Authorize (در صورت وجود)
+        # این کار مشکل شناسایی جدول/ستون و تکرار رکوردها را کاهش می‌دهد.
+        try:
+            sql = (
+                """
+                SELECT TOP 50
+                    A.id      AS Id,
+                    A.UserName AS Name
+                FROM dbo.Authorize A
+                WHERE A.UserName LIKE ?
+                ORDER BY A.UserName;
+                """
+            )
+            cursor.execute(sql, (f"%{name_part}%",))
+            rows = cursor.fetchall()
+            if rows:
+                return [(r[0], "" if r[1] is None else str(r[1])) for r in rows]
+        except Exception:
+            # اگر جدول/ستون Authorize وجود نداشت، به روش انعطاف‌پذیر قبلی برگرد.
+            pass
+
+        # مرحله‌ی دوم: روش انعطاف‌پذیر روی چند جدول/ستون احتمالی
+        table_candidates = ["Authorize", "Users", "User", "tblUsers", "tblUser"]
+        id_candidates = ["ID", "Id", "UserId", "id"]
+        name_candidates = ["UserName", "Username", "Name", "FullName"]
         for t in table_candidates:
             for idc in id_candidates:
                 for nc in name_candidates:
                     try:
-                        sql = f"SELECT TOP 50 {idc} AS Id, {nc} AS Name FROM dbo.{t} WHERE {nc} LIKE ? ORDER BY {nc};"
+                        sql = (
+                            f"SELECT TOP 50 {idc} AS Id, {nc} AS Name "
+                            f"FROM dbo.{t} WHERE {nc} LIKE ? ORDER BY {nc};"
+                        )
                         cursor.execute(sql, (f"%{name_part}%",))
                         rows = cursor.fetchall()
                         if rows:
-                            return [(r[0], str(r[1])) for r in rows]
+                            return [
+                                (r[0], "" if r[1] is None else str(r[1])) for r in rows
+                            ]
                     except Exception:
                         continue
         return []
