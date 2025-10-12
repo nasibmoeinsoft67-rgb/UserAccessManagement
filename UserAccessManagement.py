@@ -19,6 +19,10 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QFormLayout,
     QDesktopWidget,
+    QDialog,
+    QListWidget,
+    QListWidgetItem,
+    QDialogButtonBox,
 )
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QIcon
@@ -337,6 +341,83 @@ class AutoConnectWindow(QWidget):
             self.close()
             self.manual = ManualConnectWindow()
             self.manual.show()
+
+# ----------------------------- انتخابگر کاربر -----------------------------
+class UserSelectDialog(QDialog):
+    def __init__(self, main_window: 'MainWindow'):
+        super().__init__(main_window)
+        self.main = main_window
+        self._selected = None
+
+        self.setWindowTitle("انتخاب کاربر")
+        self.setGeometry(480, 260, 440, 520)
+        apply_window_icon(self)
+        center_window(self)
+
+        layout = QVBoxLayout()
+
+        self.search_box = QLineEdit()
+        self.search_box.setPlaceholderText("جست‌وجوی کاربر (اختیاری)")
+        layout.addWidget(self.search_box)
+
+        self.list_widget = QListWidget()
+        layout.addWidget(self.list_widget)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._handle_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.setLayout(layout)
+
+        # رویدادها
+        self.search_box.textChanged.connect(self._on_search_text_changed)
+        self.list_widget.itemDoubleClicked.connect(self._handle_item_double_clicked)
+
+        # بارگذاری اولیه از دیتابیس بدون نیاز به تایپ
+        try:
+            users = self.main.query_users_initial()
+            self._populate(users)
+        except Exception as e:
+            QMessageBox.critical(self, "خطا", f"خطا در بارگذاری کاربران:\n{str(e)}")
+
+    def _populate(self, users: list):
+        self.list_widget.clear()
+        for uid, uname in users:
+            text = f"{uid} - {uname}"
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, (uid, uname))
+            self.list_widget.addItem(item)
+
+    def _on_search_text_changed(self, text: str):
+        try:
+            t = (text or "").strip()
+            if t:
+                users = self.main.query_users_by_name(t)
+            else:
+                users = self.main.query_users_initial()
+            self._populate(users)
+        except Exception as e:
+            QMessageBox.critical(self, "خطا", f"خطا در جست‌وجوی کاربر:\n{str(e)}")
+
+    def _handle_accept(self):
+        item = self.list_widget.currentItem()
+        if not item:
+            QMessageBox.warning(self, "انتخاب کاربر", "یک کاربر را انتخاب کنید.")
+            return
+        uid, uname = item.data(Qt.UserRole)
+        self._selected = (uid, uname)
+        self.accept()
+
+    def _handle_item_double_clicked(self, item: QListWidgetItem):
+        if item is None:
+            return
+        uid, uname = item.data(Qt.UserRole)
+        self._selected = (uid, uname)
+        self.accept()
+
+    def selected_user(self):
+        return self._selected if self._selected is not None else (None, "")
 
 # ----------------------------- پنجره‌ی اصلی -----------------------------
 class MainWindow(QWidget):
@@ -679,26 +760,16 @@ class MainWindow(QWidget):
         ok = self.select_user_workflow()
         return (self.current_user_id if ok else None), ok
 
-    # ------------------ انتخاب کاربر بر اساس نام ------------------
+    # ------------------ انتخاب کاربر از لیست ------------------
     def select_user_workflow(self) -> bool:
         try:
-            text, ok = QInputDialog.getText(self, "انتخاب کاربر", "نام کاربر را وارد کنید (یا بخشی از آن):")
-            if not ok or not text.strip():
+            dlg = UserSelectDialog(self)
+            result = dlg.exec_()
+            if result != QDialog.Accepted:
                 return False
-            # ابتدا از Authorize با EXISTS روی UserAccess استفاده می‌کنیم تا تکرار نداشته باشیم
-            candidates = self.query_users_by_name(text.strip())
-            if not candidates:
-                QMessageBox.warning(self, "یافت نشد", "کاربری با این نام پیدا نشد.")
+            uid, uname = dlg.selected_user()
+            if uid is None:
                 return False
-            if len(candidates) == 1:
-                uid, uname = candidates[0]
-            else:
-                items = [f"{uid} - {uname}" for uid, uname in candidates]
-                choice, ok = QInputDialog.getItem(self, "انتخاب کاربر", "یکی را انتخاب کنید:", items, 0, False)
-                if not ok:
-                    return False
-                uid = int(choice.split(" - ", 1)[0])
-                uname = choice.split(" - ", 1)[1]
             self.current_user_id = uid
             self.current_user_name = uname
             # پس از انتخاب کاربر، همه فرم‌ها را برای ویرایش نمایش بده
@@ -770,6 +841,45 @@ class MainWindow(QWidget):
                             rows = cursor.fetchall()
                             if rows:
                                 return [(r[0], "" if r[1] is None else str(r[1])) for r in rows]
+                    except Exception:
+                        continue
+        return []
+
+    def query_users_initial(self, limit: int = 200):
+        """برگرداندن فهرست اولیه کاربران بدون نیاز به ورودی نام.
+
+        تلاش می‌کند از جدول‌های رایج (ترجیح: Authorize) لیست را بخواند.
+        """
+        cursor = self.conn.cursor()
+        # تلاش اول: جدول Authorize
+        try:
+            sql = (
+                f"SELECT TOP {limit} A.id AS Id, A.UserName AS Name "
+                "FROM dbo.Authorize A ORDER BY A.UserName;"
+            )
+            cursor.execute(sql)
+            rows = cursor.fetchall()
+            if rows:
+                return [(r[0], "" if r[1] is None else str(r[1])) for r in rows]
+        except Exception:
+            pass
+
+        # تلاش‌های جایگزین روی جدول‌ها/ستون‌های رایج
+        table_candidates = ["Authorize", "Users", "User", "tblUsers", "tblUser"]
+        id_candidates = ["ID", "Id", "UserId", "id"]
+        name_candidates = ["UserName", "Username", "Name", "FullName"]
+        for t in table_candidates:
+            for idc in id_candidates:
+                for nc in name_candidates:
+                    try:
+                        sql = (
+                            f"SELECT TOP {limit} {idc} AS Id, {nc} AS Name FROM dbo.{t} "
+                            f"ORDER BY {nc};"
+                        )
+                        cursor.execute(sql)
+                        rows = cursor.fetchall()
+                        if rows:
+                            return [(r[0], "" if r[1] is None else str(r[1])) for r in rows]
                     except Exception:
                         continue
         return []
