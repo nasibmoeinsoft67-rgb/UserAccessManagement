@@ -226,6 +226,65 @@ def auto_connect():
                 continue
     return None, None, None
 
+# ----------------------------- اطمینان از وجود ستون IsActive -----------------------------
+def ensure_isactive_column(conn) -> None:
+    """ستون `IsActive` را در صورت نبود روی جدول `dbo.UserAccess` می‌سازد و مقادیر Null را 1 می‌کند.
+
+    این کار برای جلوگیری از خطای لود دیتا در فرم‌ها ضروری است.
+    """
+    cur = conn.cursor()
+    try:
+        # آیا جدول UserAccess وجود دارد؟
+        cur.execute(
+            """
+            SELECT 1
+            FROM INFORMATION_SCHEMA.TABLES
+            WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = 'UserAccess'
+            """
+        )
+        tbl_exists = cur.fetchone() is not None
+        if not tbl_exists:
+            logger.warning("Table dbo.UserAccess not found; skip ensuring IsActive column.")
+            return
+
+        # آیا ستون IsActive وجود دارد؟
+        cur.execute(
+            """
+            SELECT 1
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = 'UserAccess' AND COLUMN_NAME = 'IsActive'
+            """
+        )
+        col_exists = cur.fetchone() is not None
+
+        if not col_exists:
+            # اضافه کردن ستون با مقدار پیش‌فرض 1 برای ردیف‌های موجود
+            cur.execute(
+                """
+                ALTER TABLE dbo.UserAccess
+                ADD IsActive BIT NOT NULL CONSTRAINT DF_UserAccess_IsActive DEFAULT (1) WITH VALUES;
+                """
+            )
+            conn.commit()
+            logger.info("IsActive column added to dbo.UserAccess with default 1.")
+        else:
+            # اگر ستون وجود داشت، مقدارهای Null را 1 کن تا فرم‌ها درست لود شوند
+            cur.execute("UPDATE dbo.UserAccess SET IsActive = 1 WHERE IsActive IS NULL;")
+            conn.commit()
+            logger.info("IsActive nulls backfilled to 1 on dbo.UserAccess.")
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.exception("Failed to ensure IsActive column on dbo.UserAccess")
+        raise
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+
 # ----------------------------- توابع کمکی جهت فراخوانی Stored Procedure ----------
 def _exec_proc(conn, proc_call: str, params: List):
     """فراخوانی عمومی پروسیجر با پارامترها.
@@ -368,19 +427,8 @@ class ManualConnectWindow(QWidget):
         try:
             conn_str = f"DRIVER={{SQL Server}};SERVER={server};DATABASE={db};UID={user};PWD={pwd}"
             conn = pyodbc.connect(conn_str, autocommit=False)
-
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                SELECT COLUMN_NAME
-                FROM INFORMATION_SCHEMA.COLUMNS
-                WHERE TABLE_NAME = 'UserAccess' AND COLUMN_NAME = 'IsActive'
-                """
-            )
-            exists = cursor.fetchone()
-            if not exists:
-                cursor.execute("ALTER TABLE dbo.UserAccess ADD IsActive BIT DEFAULT 1;")
-                conn.commit()
+            # تضمین وجود ستون IsActive قبل از نمایش فرم‌ها
+            ensure_isactive_column(conn)
 
             QMessageBox.information(self, "موفقیت ✅", f"اتصال موفق به دیتابیس '{db}' برقرار شد.")
             self.close()
@@ -410,6 +458,12 @@ class AutoConnectWindow(QWidget):
     def try_auto_connect(self):
         conn, server, db = auto_connect()
         if conn:
+            # تضمین وجود ستون IsActive در اتصال خودکار نیز
+            try:
+                ensure_isactive_column(conn)
+            except Exception as e:
+                # خطا را نشان بده ولی ادامه بده تا کاربر بتواند مسیر دستی را برود
+                QMessageBox.warning(self, "خطای سازگارسازی اسکیم", f"عدم موفقیت در تضمین ستون IsActive:\n{str(e)}")
             QMessageBox.information(self, "موفقیت ✅", f"اتصال خودکار برقرار شد:\n{server} → {db}")
             self.close()
             self.main_window = MainWindow(conn)
@@ -602,6 +656,39 @@ class MainWindow(QWidget):
         if not ok:
             return
 
+        # بررسی وجود ستون‌های مرتب‌سازی برای جلوگیری از خطای Invalid column name
+        def column_exists(conn, schema: str, table: str, column: str) -> bool:
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?
+                    """,
+                    (schema, table, column),
+                )
+                return cur.fetchone() is not None
+            except Exception:
+                return False
+            finally:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+
+        has_menu_order = column_exists(self.conn, 'dbo', 'Forms', 'MenuOrder')
+        has_button_order = column_exists(self.conn, 'dbo', 'FormButtons', 'ButtonOrder')
+
+        order_parts = []
+        if has_menu_order:
+            order_parts.append('f.MenuOrder')
+        if has_button_order:
+            order_parts.append('fb.ButtonOrder')
+        # همواره یک ترتیب پایدار جایگزین داشته باشیم
+        order_parts.extend(['f.Name', 'fb.Name'])
+        order_clause = ', '.join(order_parts)
+
         query = f"""
             SELECT 
                 f.Name AS FormName,
@@ -613,7 +700,7 @@ class MainWindow(QWidget):
             LEFT JOIN dbo.UserAccess ua 
                 ON ua.FormButtonsId = fb.ID 
                 AND ua.UserId = {user_id}
-            ORDER BY f.MenuOrder, fb.ButtonOrder;
+            ORDER BY {order_clause};
         """
         self.load_data(query, editable=True, user_id=user_id)
 
