@@ -672,8 +672,8 @@ class MainWindow(QWidget):
 
         # دکمه‌ها
         button_layout = QVBoxLayout()
-        self.btn_show_allowed = QPushButton("نمایش فرم های مجاز")
-        self.btn_show_denied = QPushButton("نمایش فرم های غیرمجاز")
+        self.btn_show_allowed = QPushButton("نمایش فرم های غیرمجاز")
+        self.btn_show_denied = QPushButton("نمایش فرم های مجاز")
         self.btn_show_all = QPushButton("نمایش همه فرم‌ها")
         self.btn_save_all = QPushButton("ذخیره تغییرات")
         button_layout.addWidget(self.btn_show_allowed)
