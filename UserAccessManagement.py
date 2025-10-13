@@ -27,6 +27,18 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QIcon
 from PyQt5.QtCore import QSettings
+import logging
+from typing import List, Optional
+
+# ----------------------------- تنظیم logging -----------------------------
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    fmt = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
 
 # ----------------------------- ثابت‌های عمومی -----------------------------
 DEFAULT_PASSWORD = "xx17737xx"
@@ -213,6 +225,76 @@ def auto_connect():
             except Exception:
                 continue
     return None, None, None
+
+# ----------------------------- توابع کمکی جهت فراخوانی Stored Procedure ----------
+def _exec_proc(conn, proc_call: str, params: List):
+    """فراخوانی عمومی پروسیجر با پارامترها.
+    proc_call: رشتهٔ SQL مانند 'EXEC dbo.MyProc ?, ?, ?'
+    params: لیست یا تاپل پارامترها
+    """
+    cur = conn.cursor()
+    try:
+        cur.execute(proc_call, params)
+        # اگر پروسیجر چیزی برگرداند و بخواهیم مصرف کنیم، می‌توانیم از cur.fetchone() استفاده کنیم.
+        conn.commit()
+        return True, None
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.exception('Error executing proc: %s', proc_call)
+        return False, str(e)
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+
+
+def set_user_access_rewrite(conn, user_id: int, formbutton_ids: List[int], changed_by: Optional[int] = None):
+    """
+    برای هر کاربر، تمام رکوردهای موجود حذف شده و لیست ارسال شده درج می‌شود.
+    پارامترها:
+    conn: اتصال pyodbc
+    user_id: شناسه کاربر
+    formbutton_ids: لیست اعداد FormButtonsId
+    changed_by: شناسهٔ کاربری که این تغییر را انجام داده (برای History)
+    """
+    # تبدیل لیست به رشتهٔ "4,5,6"
+    ids_str = ','.join(str(int(x)) for x in formbutton_ids) if formbutton_ids else ''
+    proc = 'EXEC dbo.SetUserAccess_Rewrite ?, ?, ?'
+    params = (user_id, ids_str, changed_by)
+    ok, err = _exec_proc(conn, proc, params)
+    if not ok:
+        raise RuntimeError(f'SetUserAccess_Rewrite failed: {err}')
+    logger.info('SetUserAccess_Rewrite succeeded for UserId=%s (count=%d)', user_id, len(formbutton_ids))
+
+
+def set_user_access_single(conn, user_id: int, formbutton_id: int, is_active: bool, changed_by: Optional[int] = None):
+    """
+    اگر رکورد وجود نداشت درج می‌کند، در غیر این صورت مقدار IsActive را به‌روزرسانی می‌کند.
+    این تابع پروسیجر dbo.SetUserAccess_Single را اجرا می‌کند.
+    """
+    proc = 'EXEC dbo.SetUserAccess_Single ?, ?, ?, ?'
+    params = (user_id, formbutton_id, 1 if is_active else 0, changed_by)
+    ok, err = _exec_proc(conn, proc, params)
+    if not ok:
+        raise RuntimeError(f'SetUserAccess_Single failed: {err}')
+    logger.info('SetUserAccess_Single done: UserId=%s FB=%s Active=%s', user_id, formbutton_id, is_active)
+
+
+def set_form_access_for_user(conn, user_id: int, form_id: int, is_active: bool, changed_by: Optional[int] = None):
+    """
+    برای تمام FormButtons مربوط به form_id حالتی (فعال/غیرفعال) اعمال می‌کند.
+    پروسیجر dbo.SetFormAccess_ForUser را فراخوانی می‌کند.
+    """
+    proc = 'EXEC dbo.SetFormAccess_ForUser ?, ?, ?, ?'
+    params = (user_id, form_id, 1 if is_active else 0, changed_by)
+    ok, err = _exec_proc(conn, proc, params)
+    if not ok:
+        raise RuntimeError(f'SetFormAccess_ForUser failed: {err}')
+    logger.info('SetFormAccess_ForUser done: UserId=%s FormId=%s Active=%s', user_id, form_id, is_active)
 
 # ----------------------------- پنجره‌ی اتصال -----------------------------
 class LoginWindow(QWidget):
@@ -652,28 +734,9 @@ class MainWindow(QWidget):
         در غیر این صورت مقدار IsActive را UPDATE می‌کند.
         """
         try:
-            cursor = self.conn.cursor()
-            # مقدار باینری (1 یا 0) براساس state
-            active = 1 if state == Qt.Checked else 0
-
-            # از یک بلوک IF NOT EXISTS استفاده می‌کنیم تا یا درج یا بروزرسانی انجام شود
-            sql = """
-                IF NOT EXISTS (
-                    SELECT 1 FROM dbo.UserAccess WHERE UserId = ? AND FormButtonsId = ?
-                )
-                BEGIN
-                    INSERT INTO dbo.UserAccess (UserId, FormButtonsId, IsActive)
-                    VALUES (?, ?, ?)
-                END
-                ELSE
-                BEGIN
-                    UPDATE dbo.UserAccess SET IsActive = ? WHERE UserId = ? AND FormButtonsId = ?
-                END
-            """
-            # ترتیب پارامترها مطابق علامت‌گذاری‌های ? در کوئری بالا
-            params = (user_id, form_button_id, user_id, form_button_id, active, active, user_id, form_button_id)
-            cursor.execute(sql, params)
-            self.conn.commit()
+            # استفاده از Stored Procedure به جای SQL مستقیم
+            is_active = state == Qt.Checked
+            set_user_access_single(self.conn, user_id, form_button_id, is_active)
             self.notify_saved("تغییر ذخیره شد")
         except Exception as e:
             QMessageBox.critical(self, "خطا در ذخیره تغییر", f"خطا هنگام ذخیره تغییر:\n{str(e)}")
@@ -716,30 +779,9 @@ class MainWindow(QWidget):
 
     def set_form_access(self, user_id, form_id, state):
         try:
-            cursor = self.conn.cursor()
-            active = 1 if state == Qt.Checked else 0
-            sql = """
-                -- ابتدا بروزرسانی ردیف‌های موجود برای این فرم
-                UPDATE ua SET ua.IsActive = ?
-                FROM dbo.UserAccess ua
-                JOIN dbo.FormButtons fb ON ua.FormButtonsId = fb.ID
-                WHERE ua.UserId = ? AND fb.IDForm = ?;
-
-                -- سپس درج ردیف‌های جدید برای دکمه‌های فاقد رکورد
-                INSERT INTO dbo.UserAccess (UserId, FormButtonsId, IsActive)
-                SELECT ?, fb.ID, ?
-                FROM dbo.FormButtons fb
-                WHERE fb.IDForm = ? AND NOT EXISTS (
-                    SELECT 1 FROM dbo.UserAccess ua
-                    WHERE ua.UserId = ? AND ua.FormButtonsId = fb.ID
-                );
-            """
-            params = (
-                active, user_id, form_id,
-                user_id, active, form_id, user_id,
-            )
-            cursor.execute(sql, params)
-            self.conn.commit()
+            # استفاده از Stored Procedure به جای SQL مستقیم
+            is_active = state == Qt.Checked
+            set_form_access_for_user(self.conn, user_id, form_id, is_active)
             self.notify_saved("دسترسی فرم بروزرسانی شد")
         except Exception as e:
             QMessageBox.critical(self, "خطا در ذخیره تغییر", f"خطا هنگام ذخیره تغییر:\n{str(e)}")
