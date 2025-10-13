@@ -226,6 +226,27 @@ def auto_connect():
                 continue
     return None, None, None
 
+# ----------------------------- بررسی وجود Stored Procedure -----------------------------
+def stored_procedure_exists(conn, schema_name: str, procedure_name: str) -> bool:
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            SELECT 1
+            FROM sys.procedures
+            WHERE name = ? AND schema_id = SCHEMA_ID(?)
+            """,
+            (procedure_name, schema_name),
+        )
+        return cursor.fetchone() is not None
+    except Exception:
+        return False
+    finally:
+        try:
+            cursor.close()
+        except Exception:
+            pass
+
 # ----------------------------- توابع کمکی جهت فراخوانی Stored Procedure ----------
 def _exec_proc(conn, proc_call: str, params: List):
     """فراخوانی عمومی پروسیجر با پارامترها.
@@ -263,11 +284,14 @@ def set_user_access_rewrite(conn, user_id: int, formbutton_ids: List[int], chang
     """
     # تبدیل لیست به رشتهٔ "4,5,6"
     ids_str = ','.join(str(int(x)) for x in formbutton_ids) if formbutton_ids else ''
-    proc = 'EXEC dbo.SetUserAccess_Rewrite ?, ?, ?'
-    params = (user_id, ids_str, changed_by)
-    ok, err = _exec_proc(conn, proc, params)
-    if not ok:
-        raise RuntimeError(f'SetUserAccess_Rewrite failed: {err}')
+    if stored_procedure_exists(conn, 'dbo', 'SetUserAccess_Rewrite'):
+        proc = 'EXEC dbo.SetUserAccess_Rewrite ?, ?, ?'
+        params = (user_id, ids_str, changed_by)
+        ok, err = _exec_proc(conn, proc, params)
+        if not ok:
+            raise RuntimeError(f'SetUserAccess_Rewrite failed: {err}')
+    else:
+        _fallback_set_user_access_rewrite(conn, user_id, formbutton_ids)
     logger.info('SetUserAccess_Rewrite succeeded for UserId=%s (count=%d)', user_id, len(formbutton_ids))
 
 
@@ -276,11 +300,14 @@ def set_user_access_single(conn, user_id: int, formbutton_id: int, is_active: bo
     اگر رکورد وجود نداشت درج می‌کند، در غیر این صورت مقدار IsActive را به‌روزرسانی می‌کند.
     این تابع پروسیجر dbo.SetUserAccess_Single را اجرا می‌کند.
     """
-    proc = 'EXEC dbo.SetUserAccess_Single ?, ?, ?, ?'
-    params = (user_id, formbutton_id, 1 if is_active else 0, changed_by)
-    ok, err = _exec_proc(conn, proc, params)
-    if not ok:
-        raise RuntimeError(f'SetUserAccess_Single failed: {err}')
+    if stored_procedure_exists(conn, 'dbo', 'SetUserAccess_Single'):
+        proc = 'EXEC dbo.SetUserAccess_Single ?, ?, ?, ?'
+        params = (user_id, formbutton_id, 1 if is_active else 0, changed_by)
+        ok, err = _exec_proc(conn, proc, params)
+        if not ok:
+            raise RuntimeError(f'SetUserAccess_Single failed: {err}')
+    else:
+        _fallback_set_user_access_single(conn, user_id, formbutton_id, is_active)
     logger.info('SetUserAccess_Single done: UserId=%s FB=%s Active=%s', user_id, formbutton_id, is_active)
 
 
@@ -289,12 +316,110 @@ def set_form_access_for_user(conn, user_id: int, form_id: int, is_active: bool, 
     برای تمام FormButtons مربوط به form_id حالتی (فعال/غیرفعال) اعمال می‌کند.
     پروسیجر dbo.SetFormAccess_ForUser را فراخوانی می‌کند.
     """
-    proc = 'EXEC dbo.SetFormAccess_ForUser ?, ?, ?, ?'
-    params = (user_id, form_id, 1 if is_active else 0, changed_by)
-    ok, err = _exec_proc(conn, proc, params)
-    if not ok:
-        raise RuntimeError(f'SetFormAccess_ForUser failed: {err}')
+    if stored_procedure_exists(conn, 'dbo', 'SetFormAccess_ForUser'):
+        proc = 'EXEC dbo.SetFormAccess_ForUser ?, ?, ?, ?'
+        params = (user_id, form_id, 1 if is_active else 0, changed_by)
+        ok, err = _exec_proc(conn, proc, params)
+        if not ok:
+            raise RuntimeError(f'SetFormAccess_ForUser failed: {err}')
+    else:
+        _fallback_set_form_access_for_user(conn, user_id, form_id, is_active)
     logger.info('SetFormAccess_ForUser done: UserId=%s FormId=%s Active=%s', user_id, form_id, is_active)
+
+# ----------------------------- پیاده‌سازی‌های جایگزین (Fallback) ----------------------
+def _fallback_set_user_access_single(conn, user_id: int, formbutton_id: int, is_active: bool) -> None:
+    cursor = conn.cursor()
+    try:
+        is_active_bit = 1 if is_active else 0
+        cursor.execute(
+            """
+            MERGE dbo.UserAccess AS target
+            USING (SELECT CAST(? AS INT) AS UserId, CAST(? AS INT) AS FormButtonsId) AS source
+            ON target.UserId = source.UserId AND target.FormButtonsId = source.FormButtonsId
+            WHEN MATCHED THEN UPDATE SET IsActive = ?
+            WHEN NOT MATCHED THEN INSERT (UserId, FormButtonsId, IsActive)
+                 VALUES (source.UserId, source.FormButtonsId, ?);
+            """,
+            (user_id, formbutton_id, is_active_bit, is_active_bit),
+        )
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            cursor.close()
+        except Exception:
+            pass
+
+
+def _fallback_set_form_access_for_user(conn, user_id: int, form_id: int, is_active: bool) -> None:
+    cursor = conn.cursor()
+    try:
+        is_active_bit = 1 if is_active else 0
+        cursor.execute(
+            """
+            UPDATE ua
+            SET ua.IsActive = ?
+            FROM dbo.UserAccess AS ua
+            JOIN dbo.FormButtons AS fb ON fb.ID = ua.FormButtonsId
+            WHERE ua.UserId = ? AND fb.IDForm = ?;
+            """,
+            (is_active_bit, user_id, form_id),
+        )
+
+        cursor.execute(
+            """
+            INSERT INTO dbo.UserAccess (UserId, FormButtonsId, IsActive)
+            SELECT ?, fb.ID, ?
+            FROM dbo.FormButtons AS fb
+            WHERE fb.IDForm = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM dbo.UserAccess AS ua
+                  WHERE ua.UserId = ? AND ua.FormButtonsId = fb.ID
+              );
+            """,
+            (user_id, is_active_bit, form_id, user_id),
+        )
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            cursor.close()
+        except Exception:
+            pass
+
+
+def _fallback_set_user_access_rewrite(conn, user_id: int, formbutton_ids: List[int]) -> None:
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM dbo.UserAccess WHERE UserId = ?;", (user_id,))
+        ids_to_insert = [(user_id, int(fid)) for fid in (formbutton_ids or [])]
+        if ids_to_insert:
+            cursor.executemany(
+                "INSERT INTO dbo.UserAccess (UserId, FormButtonsId, IsActive) VALUES (?, ?, 1);",
+                ids_to_insert,
+            )
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            cursor.close()
+        except Exception:
+            pass
 
 # ----------------------------- پنجره‌ی اتصال -----------------------------
 class LoginWindow(QWidget):
