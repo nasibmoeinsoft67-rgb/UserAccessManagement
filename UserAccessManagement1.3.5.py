@@ -53,8 +53,10 @@ if not logger.handlers:
 DEFAULT_PASSWORD = "xx17737xx"
 SETTINGS_ORG = "AccessApp"
 SETTINGS_APP = "UserAccessManager"
-WINDOW_ICON_PATH = os.environ.get("APP_WINDOW_ICON_PATH") or None
 
+Base_Dir = getattr(sys,'_MEIPASS',os.path.dirname(os.path.abspath(__file__)))
+
+WINDOW_ICON_PATH = os.path.join(Base_Dir,"logo.png")
 # ------------------------------ ابزارهای کمکی UI ------------------------------
 def center_window(widget: QWidget) -> None:
     """قرار دادن پنجره در مرکز صفحه."""
@@ -93,15 +95,86 @@ def apply_app_icon(app: QApplication) -> None:
 def apply_theme(app: QApplication) -> None:
     """اعمال یک تم مدرن و مینیمال با رنگ‌های به‌روز."""
     qss = """
-        QWidget { background: #0f172a; color: #e2e8f0; font-size: 13px; }
-        QPushButton { background: #3b82f6; color: white; border: none; padding: 8px 12px; border-radius: 6px; }
-        QPushButton:hover { background: #2563eb; }
-        QPushButton:disabled { background: #334155; color: #94a3b8; }
-        QLineEdit, QInputDialog, QTableWidget, QTableView, QTreeWidget { background: #111827; color: #e5e7eb; border: 1px solid #334155; border-radius: 6px; padding: 6px; }
-        QHeaderView::section { background: #1f2937; color: #cbd5e1; padding: 6px; border: none; }
-        QCheckBox { spacing: 8px; }
-        QMessageBox { background: #0f172a; }
-        QLabel { color: #e2e8f0; }
+       /* --- تم تیره مشابه حسابداری معین --- */
+
+QWidget {
+    background: #1e293b;        /* پس‌زمینه اصلی */
+    color: #e2e8f0;             /* رنگ متن */
+    font-size: 13px;
+}
+
+/* دکمه‌ها */
+QPushButton {
+    background: #334155;        /* پس‌زمینه دکمه‌ها */
+    color: #c7d2fe;             /* رنگ آیکون یا متن بنفش روشن */
+    border: none;
+    padding: 12px;
+    border-radius: 12px;
+    font-weight: bold;
+}
+QPushButton:hover {
+    background: #475569;        /* حالت hover */
+}
+QPushButton:pressed {
+    background: #6366f1;        /* هنگام کلیک رنگ بنفش پررنگ */
+    color: #ffffff;
+}
+QPushButton:disabled {
+    background: #1e293b;
+    color: #64748b;
+}
+
+/* فیلدهای ورودی و جداول */
+QLineEdit, QInputDialog, QTableWidget, QTableView, QTreeWidget {
+    background: #0f172a;
+    color: #e2e8f0;
+    border: 1px solid #334155;
+    border-radius: 8px;
+    padding: 6px;
+}
+
+/* سربرگ جدول */
+QHeaderView::section {
+    background: #334155;
+    color: #cbd5e1;
+    padding: 6px;
+    border: none;
+    font-weight: bold;
+}
+
+/* چک‌باکس */
+QCheckBox {
+    spacing: 8px;
+    color: #e2e8f0;
+}
+
+/* پیام‌ها */
+QMessageBox {
+    background: #1e293b;
+    color: #f1f5f9;
+}
+
+/* لیبل‌ها */
+QLabel {
+    color: #e2e8f0;
+}
+
+/* اسکرول‌بار */
+QScrollBar:vertical {
+    background: #0f172a;
+    width: 10px;
+    margin: 0px;
+    border-radius: 4px;
+}
+QScrollBar::handle:vertical {
+    background: #475569;
+    border-radius: 4px;
+}
+QScrollBar::handle:vertical:hover {
+    background: #6366f1;
+}
+
+
     """
     app.setStyleSheet(qss)
 
@@ -158,8 +231,8 @@ def sql_normalize_expr(col_expr: str) -> str:
     )
 
 # ----------------------------- تنظیمات پیش‌فرض اتصال -----------------------------
-SERVER = r".\Moein2012"
-DATABASE = "Moein1"
+SERVER = r".\Moein"
+DATABASE = "Moein"
 USERNAME = "Sa"
 PASSWORD = "arta0@"
 
@@ -682,8 +755,8 @@ class MainWindow(QWidget):
 
         # دکمه‌ها
         button_layout = QVBoxLayout()
-        self.btn_show_allowed = QPushButton("نمایش فرم‌های مجاز")
-        self.btn_show_denied = QPushButton("نمایش فرم‌های غیرمجاز")
+        self.btn_show_allowed = QPushButton("نمایش فرم‌های غیرمجاز")
+        self.btn_show_denied = QPushButton("نمایش فرم‌های مجاز")
         self.btn_show_all = QPushButton("نمایش همه فرم‌ها")
         self.btn_save_all = QPushButton("ذخیره تغییرات")
         self.btn_export_excel = QPushButton("خروجی اکسل/CSV")
@@ -727,6 +800,7 @@ class MainWindow(QWidget):
         self.update_export_button_state()
 
         QTimer.singleShot(0, self.select_user_workflow)
+        
 
     def on_tree_item_changed(self, item, column):
         """مدیریت تغییر وضعیت checkbox"""
