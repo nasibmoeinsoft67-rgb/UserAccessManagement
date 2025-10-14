@@ -4,6 +4,11 @@ import os
 import re
 import subprocess
 import pyodbc
+import csv
+try:
+    from openpyxl import Workbook
+except Exception:
+    Workbook = None
 from PyQt5.QtWidgets import (
     QApplication,
     QWidget,
@@ -656,6 +661,11 @@ class MainWindow(QWidget):
         self.current_user_id = None
         self.current_user_name = ""
         self.current_mode = None
+        self._last_visible_forms = {}
+        self._last_user_id = None
+        self._last_is_allowed = None
+        self._button_id_to_item = {}
+        self._all_forms_dict = {}
 
         self.setWindowTitle("مدیریت سطح دسترسی کاربران")
         self.setGeometry(250, 80, 1200, 700)
@@ -672,14 +682,16 @@ class MainWindow(QWidget):
 
         # دکمه‌ها
         button_layout = QVBoxLayout()
-        self.btn_show_allowed = QPushButton("نمایش فرم های غیرمجاز")
-        self.btn_show_denied = QPushButton("نمایش فرم های مجاز")
+        self.btn_show_allowed = QPushButton("نمایش فرم‌های مجاز")
+        self.btn_show_denied = QPushButton("نمایش فرم‌های غیرمجاز")
         self.btn_show_all = QPushButton("نمایش همه فرم‌ها")
         self.btn_save_all = QPushButton("ذخیره تغییرات")
+        self.btn_export_excel = QPushButton("خروجی اکسل/CSV")
         button_layout.addWidget(self.btn_show_allowed)
         button_layout.addWidget(self.btn_show_denied)
         button_layout.addWidget(self.btn_show_all)
         button_layout.addWidget(self.btn_save_all)
+        button_layout.addWidget(self.btn_export_excel)
 
         # چیدمان دو ستونه: درخت + جدول
         main_layout = QHBoxLayout()
@@ -689,6 +701,7 @@ class MainWindow(QWidget):
         self.tree_widget.setHeaderLabels(["دسترسی", "وضعیت"])
         self.tree_widget.setColumnWidth(0, 600)
         self.tree_widget.itemChanged.connect(self.on_tree_item_changed)
+        self.tree_widget.currentItemChanged.connect(self.on_tree_selection_changed)
         main_layout.addWidget(self.tree_widget, 1)
 
         # جدول جزئیات
@@ -710,6 +723,8 @@ class MainWindow(QWidget):
         self.btn_show_denied.clicked.connect(self.show_denied_forms)
         self.btn_show_all.clicked.connect(self.show_all_forms)
         self.btn_save_all.clicked.connect(self.save_all_changes)
+        self.btn_export_excel.clicked.connect(self.export_current_view_to_file)
+        self.update_export_button_state()
 
         QTimer.singleShot(0, self.select_user_workflow)
 
@@ -728,7 +743,10 @@ class MainWindow(QWidget):
             # به‌روزرسانی وضعیت والد (فرم)
             parent = item.parent()
             if parent:
+                # ابتدا گروه را به‌روزرسانی کن سپس فرم را
                 self.update_parent_state(parent)
+                if parent.parent():
+                    self.update_parent_state(parent.parent())
         elif item_type == "form":
             # این یک فرم است - باید همه فرزندان را به‌روزرسانی کند
             form_id = item.data(0, Qt.UserRole)
@@ -738,12 +756,23 @@ class MainWindow(QWidget):
             self.tree_widget.blockSignals(True)
             for i in range(item.childCount()):
                 child = item.child(i)
-                # اطمینان از اینکه فرزندان نیز قابل تیک خوردن هستند
-                if child.flags() & Qt.ItemIsUserCheckable:
-                    child.setCheckState(0, Qt.Checked if is_checked else Qt.Unchecked)
+                self._set_children_check_state_recursive(child, Qt.Checked if is_checked else Qt.Unchecked)
             self.tree_widget.blockSignals(False)
             # پس از به‌روزرسانی فرزندان، وضعیت والد را مجدداً تنظیم کن
             self.update_parent_state(item)
+        elif item_type == "group":
+            # گروه میانی (مثل "ابزار") - همه فرزندانش را به همین حالت بگذار
+            is_checked = item.checkState(0) == Qt.Checked
+            self.tree_widget.blockSignals(True)
+            for i in range(item.childCount()):
+                child = item.child(i)
+                if child.flags() & Qt.ItemIsUserCheckable:
+                    child.setCheckState(0, Qt.Checked if is_checked else Qt.Unchecked)
+            self.tree_widget.blockSignals(False)
+            # به‌روزرسانی وضعیت فرم والد
+            if item.parent():
+                self.update_parent_state(item)
+                self.update_parent_state(item.parent())
 
 
     def update_parent_state(self, parent_item):
@@ -789,6 +818,54 @@ class MainWindow(QWidget):
              parent_item.setCheckState(0, Qt.PartiallyChecked)
         self.tree_widget.blockSignals(False)
 
+    def _set_children_check_state_recursive(self, item, state):
+        if item is None:
+            return
+        if item.flags() & Qt.ItemIsUserCheckable:
+            item.setCheckState(0, state)
+        for i in range(item.childCount()):
+            self._set_children_check_state_recursive(item.child(i), state)
+
+    def on_tree_selection_changed(self, current, previous):
+        """با انتخاب آیتم درخت، جدول سمت راست را بر اساس فرم/دکمه انتخاب‌شده به‌روزرسانی می‌کند."""
+        try:
+            if current is None:
+                return
+            item_type = current.data(0, Qt.UserRole + 1)
+            if item_type == "form":
+                form_id = current.data(0, Qt.UserRole)
+                form_name = current.text(0)
+                buttons = []
+                form_info = self._last_visible_forms.get(form_id)
+                if form_info:
+                    buttons = form_info.get('buttons', [])
+                # پر کردن جدول با دکمه‌های فرم انتخاب‌شده
+                self.table_widget.setRowCount(len(buttons))
+                self.table_widget.setColumnCount(2)
+                self.table_widget.setHorizontalHeaderLabels(["کد", "نام"])
+                row = 0
+                for btn in buttons:
+                    self.table_widget.setItem(row, 0, QTableWidgetItem(str(btn['id'])))
+                    self.table_widget.setItem(row, 1, QTableWidgetItem(f"{form_name} - {btn['name']}"))
+                    row += 1
+            elif item_type == "button":
+                button_id = current.data(0, Qt.UserRole)
+                form_item = current.parent()
+                form_name = form_item.text(0) if form_item else ""
+                button_name = current.text(0)
+                self.table_widget.setRowCount(1)
+                self.table_widget.setColumnCount(2)
+                self.table_widget.setHorizontalHeaderLabels(["کد", "نام"])
+                self.table_widget.setItem(0, 0, QTableWidgetItem(str(button_id)))
+                self.table_widget.setItem(0, 1, QTableWidgetItem(f"{form_name} - {button_name}"))
+        except Exception:
+            # بی‌صدا عبور کن تا UX خراب نشود
+            pass
+
+    def update_export_button_state(self):
+        """فعال/غیرفعال‌سازی دکمه خروجی بر اساس حالت جاری."""
+        self.btn_export_excel.setEnabled(self.current_mode in ("allowed", "denied"))
+
 
     def save_all_changes(self):
         """جمع‌آوری همه checkbox های checked و rewrite دسترسی‌ها."""
@@ -796,17 +873,30 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, "انتخاب کاربر", "ابتدا یک کاربر انتخاب کنید.")
             return
 
+        # اگر همه دکمه‌ها را داریم، بر اساس نگاشت آیتم‌ها/داده‌ها ذخیره کنیم
         checked_button_ids = []
-        for i in range(self.tree_widget.topLevelItemCount()):
-            form_item = self.tree_widget.topLevelItem(i)
-            # بررسی فرزندان (دکمه‌های فرم)
-            for j in range(form_item.childCount()):
-                button_item = form_item.child(j)
-                # اطمینان از اینکه آیتم قابل تیک خوردن است و تیک خورده است
-                if button_item.flags() & Qt.ItemIsUserCheckable and button_item.checkState(0) == Qt.Checked:
-                    button_id = button_item.data(0, Qt.UserRole)
-                    if button_id:
-                        checked_button_ids.append(button_id)
+        if self._all_forms_dict:
+            for form_id, form_data in self._all_forms_dict.items():
+                for btn in form_data.get('buttons', []):
+                    btn_id = btn.get('id')
+                    tree_item = self._button_id_to_item.get(btn_id)
+                    if tree_item is not None:
+                        is_checked = tree_item.checkState(0) == Qt.Checked
+                    else:
+                        # اگر در درخت حاضر نیست (نمای فیلترشده)، همان وضعیت قبلی‌اش را نگه دار
+                        is_checked = bool(btn.get('access'))
+                    if is_checked:
+                        checked_button_ids.append(btn_id)
+        else:
+            # حالت پشتیبان: فقط از آیتم‌های قابل مشاهده استفاده کن
+            for i in range(self.tree_widget.topLevelItemCount()):
+                form_item = self.tree_widget.topLevelItem(i)
+                for j in range(form_item.childCount()):
+                    button_item = form_item.child(j)
+                    if button_item.flags() & Qt.ItemIsUserCheckable and button_item.checkState(0) == Qt.Checked:
+                        button_id = button_item.data(0, Qt.UserRole)
+                        if button_id:
+                            checked_button_ids.append(button_id)
 
         try:
             set_user_access_rewrite(self.conn, self.current_user_id, checked_button_ids)
@@ -849,6 +939,7 @@ class MainWindow(QWidget):
             return
         self.current_mode = 'allowed'
         self.load_hierarchy(user_id, True)
+        self.update_export_button_state()
 
     def show_denied_forms(self):
         user_id, ok = self.ask_user_id()
@@ -856,6 +947,7 @@ class MainWindow(QWidget):
             return
         self.current_mode = 'denied'
         self.load_hierarchy(user_id, False)
+        self.update_export_button_state()
 
     def show_all_forms(self):
         user_id, ok = self.ask_user_id()
@@ -863,6 +955,7 @@ class MainWindow(QWidget):
             return
         self.current_mode = 'all'
         self.load_hierarchy(user_id, None)
+        self.update_export_button_state()
 
     def load_hierarchy(self, user_id, is_allowed):
         """بارگذاری درخت سلسله مراتبی فرم‌ها و دکمه‌های آنها"""
@@ -889,7 +982,7 @@ class MainWindow(QWidget):
             cursor.execute(query, (user_id,))
             rows = cursor.fetchall()
 
-            # گروه‌بندی داده‌ها بر اساس فرم
+            # گروه‌بندی داده‌ها بر اساس فرم (همه فرم‌ها بدون فیلتر)
             forms_dict = {}
             for row in rows:
                 form_id, form_name, button_id, button_name, has_access = row
@@ -907,7 +1000,12 @@ class MainWindow(QWidget):
                         'access': has_access
                     })
 
-            # ساخت درخت
+            # قبل از ساخت درخت، نگاشت‌ها را ریست کنیم
+            self._button_id_to_item = {}
+            self._all_forms_dict = forms_dict
+
+            # ساخت درخت (فقط فرم‌های قابل نمایش)
+            visible_forms = {}
             for form_id, form_data in forms_dict.items():
                 # بررسی فیلتر
                 if is_allowed is not None:
@@ -922,11 +1020,9 @@ class MainWindow(QWidget):
                 form_item = QTreeWidgetItem(self.tree_widget, [form_data['name'], ""])
                 form_item.setData(0, Qt.UserRole, form_id)
                 form_item.setData(0, Qt.UserRole + 1, "form")
-                
-                # اضافه کردن checkbox در حالت 'all'
-                if self.current_mode == 'all':
-                    form_item.setFlags(form_item.flags() | Qt.ItemIsUserCheckable)
-                    form_item.setCheckState(0, Qt.Unchecked) # پیش‌فرض Unchecked
+                # همیشه والد قابل تیک خوردن باشد (انتخاب همه در همان بخش)
+                form_item.setFlags(form_item.flags() | Qt.ItemIsUserCheckable)
+                form_item.setCheckState(0, Qt.Unchecked)
 
                 # اضافه کردن دکمه‌های فرم (فرزندان)
                 checked_count = 0
@@ -936,13 +1032,13 @@ class MainWindow(QWidget):
                     button_item = QTreeWidgetItem(form_item, [button['name'], ""])
                     button_item.setData(0, Qt.UserRole, button['id'])
                     button_item.setData(0, Qt.UserRole + 1, "button")
-                    
-                    # اضافه کردن checkbox در حالت 'all'
-                    if self.current_mode == 'all':
-                        button_item.setFlags(button_item.flags() | Qt.ItemIsUserCheckable)
-                        button_item.setCheckState(0, Qt.Checked if button['access'] else Qt.Unchecked)
-                        if button['access']:
-                            checked_count += 1
+                    # نگاشت برای ذخیره‌سازی امن در حالت‌های فیلترشده
+                    self._button_id_to_item[button['id']] = button_item
+                    # همیشه فرزندان قابل تیک خوردن باشند
+                    button_item.setFlags(button_item.flags() | Qt.ItemIsUserCheckable)
+                    button_item.setCheckState(0, Qt.Checked if button['access'] else Qt.Unchecked)
+                    if button['access']:
+                        checked_count += 1
                     
                     # رنگ‌آمیزی بر اساس دسترسی
                     if button['access']:
@@ -951,7 +1047,7 @@ class MainWindow(QWidget):
                         button_item.setForeground(0, QBrush(QColor("#ef4444")))  # قرمز
 
                 # تنظیم وضعیت checkbox والد بر اساس فرزندان
-                if self.current_mode == 'all' and has_buttons:
+                if has_buttons:
                     total_buttons = len(form_data['buttons'])
                     if checked_count == 0:
                         form_item.setCheckState(0, Qt.Unchecked)
@@ -959,22 +1055,30 @@ class MainWindow(QWidget):
                         form_item.setCheckState(0, Qt.Checked)
                     else:
                         form_item.setCheckState(0, Qt.PartiallyChecked)
-                elif self.current_mode == 'all' and not has_buttons:
+                else:
                     # اگر فرم دکمه‌ای ندارد، والد نباید قابل تیک خوردن باشد
                     form_item.setFlags(form_item.flags() & ~Qt.ItemIsUserCheckable)
                     form_item.setCheckState(0, Qt.Unchecked)
 
+                # ذخیره در فرم‌های قابل نمایش
+                visible_forms[form_id] = form_data
+
 
             self.tree_widget.expandAll()
 
-            button_count = sum(len(f['buttons']) for f in forms_dict.values())
+            button_count = sum(len(f['buttons']) for f in visible_forms.values())
             self.table_widget.setRowCount(button_count)
             row_idx = 0
-            for form_id, form_data in forms_dict.items():
+            for form_id, form_data in visible_forms.items():
                 for button in form_data['buttons']:
                     self.table_widget.setItem(row_idx, 0, QTableWidgetItem(str(button['id'])))
                     self.table_widget.setItem(row_idx, 1, QTableWidgetItem(f"{form_data['name']} - {button['name']}"))
                     row_idx += 1
+
+            # ذخیره آخرین وضعیت نمایش برای استفاده در جزئیات و خروجی
+            self._last_visible_forms = visible_forms
+            self._last_user_id = user_id
+            self._last_is_allowed = is_allowed
 
         except Exception as e:
             QMessageBox.critical(self, "خطا در اجرا", f"خطا هنگام بارگذاری داده:\n{str(e)}")
@@ -982,27 +1086,46 @@ class MainWindow(QWidget):
             self.tree_widget.blockSignals(False)
 
     def filter_tree_and_table(self, text: str):
-        """فیلتر کردن درخت و جدول بر اساس جست‌وجو"""
+        """فیلتر کردن درخت و جدول بر اساس جست‌وجو (نمایش والد وقتی فرزند match می‌شود)."""
         norm_text = normalize_persian_text(text or "")
-        tokens = [t.strip() for t in norm_text.split() if t.strip()]
-        
-        # فیلتر درخت
+        tokens = [t.strip().lower() for t in norm_text.split() if t.strip()]
+
+        def full_path_text(item):
+            names = []
+            cur = item
+            while cur is not None:
+                names.append(cur.text(0) or "")
+                cur = cur.parent()
+            names.reverse()
+            return normalize_persian_text(" / ".join(names)).lower()
+
+        def recurse(item):
+            if item is None:
+                return False
+            item_text = full_path_text(item)
+            match_self = all(tok in item_text for tok in tokens)
+            any_child = False
+            for i in range(item.childCount()):
+                if recurse(item.child(i)):
+                    any_child = True
+            match = match_self or any_child or (len(tokens) == 0)
+            item.setHidden(not match)
+            if match:
+                self.tree_widget.expandItem(item)
+            return match
+
         for i in range(self.tree_widget.topLevelItemCount()):
-            item = self.tree_widget.topLevelItem(i)
-            self.filter_tree_item(item, tokens)
-            for j in range(item.childCount()):
-                child = item.child(j)
-                self.filter_tree_item(child, tokens)
-        
-        # فیلتر جدول
+            recurse(self.tree_widget.topLevelItem(i))
+
+        # فیلتر جدول (ساده، بر اساس متن سطر)
         for i in range(self.table_widget.rowCount()):
             cell_texts = []
             for j in range(self.table_widget.columnCount()):
-                item = self.table_widget.item(i, j)
-                if item is not None:
-                    cell_texts.append(item.text())
-            row_text = normalize_persian_text(" ".join(cell_texts))
-            visible = all(tok.lower() in row_text.lower() for tok in tokens)
+                cell = self.table_widget.item(i, j)
+                if cell is not None:
+                    cell_texts.append(cell.text())
+            row_text = normalize_persian_text(" ".join(cell_texts)).lower()
+            visible = all(tok in row_text for tok in tokens)
             self.table_widget.setRowHidden(i, not visible)
 
     def filter_tree_item(self, item, tokens):
@@ -1010,6 +1133,57 @@ class MainWindow(QWidget):
         row_text = normalize_persian_text(item.text(0))
         visible = all(tok.lower() in row_text.lower() for tok in tokens)
         item.setHidden(not visible)
+
+    def export_current_view_to_file(self):
+        """خروجی Excel (xlsx) یا CSV از نمای فعلی فرم‌های مجاز/غیرمجاز."""
+        if self.current_mode not in ("allowed", "denied"):
+            QMessageBox.warning(self, "خروجی اکسل", "لطفاً ابتدا نمای فرم‌های مجاز یا غیرمجاز را انتخاب کنید.")
+            return
+        filter_str = "Excel Files (*.xlsx);;CSV Files (*.csv)"
+        default_name = "خروجی_دسترسی.xlsx" if Workbook else "خروجی_دسترسی.csv"
+        path, selected_filter = QFileDialog.getSaveFileName(self, "ذخیره خروجی", default_name, filter_str)
+        if not path:
+            return
+        rows = self._collect_current_view_rows()
+        try:
+            if path.lower().endswith('.xlsx') and Workbook:
+                wb = Workbook()
+                ws = wb.active
+                ws.title = "Access"
+                ws.append(["UserId", "UserName", "FormId", "FormName", "ButtonId", "ButtonName", "Access"])
+                for r in rows:
+                    ws.append(r)
+                wb.save(path)
+                QMessageBox.information(self, "خروجی اکسل", "فایل Excel با موفقیت ذخیره شد.")
+            else:
+                if not path.lower().endswith('.csv'):
+                    path = path + '.csv'
+                with open(path, 'w', newline='', encoding='utf-8-sig') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["UserId", "UserName", "FormId", "FormName", "ButtonId", "ButtonName", "Access"])
+                    writer.writerows(rows)
+                QMessageBox.information(self, "خروجی اکسل", "فایل CSV با موفقیت ذخیره شد.")
+        except Exception as e:
+            QMessageBox.critical(self, "خروجی اکسل", f"خطا در ذخیره فایل:\n{str(e)}")
+
+    def _collect_current_view_rows(self):
+        """جمع‌آوری ردیف‌های قابل مشاهده برای خروجی."""
+        output_rows = []
+        for i in range(self.tree_widget.topLevelItemCount()):
+            form_item = self.tree_widget.topLevelItem(i)
+            if form_item.isHidden():
+                continue
+            form_id = form_item.data(0, Qt.UserRole)
+            form_name = form_item.text(0)
+            for j in range(form_item.childCount()):
+                button_item = form_item.child(j)
+                if button_item.isHidden():
+                    continue
+                button_id = button_item.data(0, Qt.UserRole)
+                button_name = button_item.text(0)
+                access = 1 if button_item.checkState(0) == Qt.Checked else 0
+                output_rows.append([self.current_user_id, self.current_user_name, form_id, form_name, button_id, button_name, access])
+        return output_rows
 
     def reload_current_mode(self):
         """بارگذاری مجدد حالت فعلی"""
